@@ -431,6 +431,47 @@ impl VerifiedWebhookMessages {
     }
 }
 
+/// Hand verified Sendblue messages to the channel server's live listener so
+/// they get the full conversational path: per-sender history, session
+/// persistence, and interrupt-on-new-message. The gateway chat fallback is a
+/// stateless one-shot (`process_message` builds each turn from only the
+/// system prompt and the current message), which is the right shape for the
+/// `/webhook` API but loses conversation continuity for a messaging channel.
+///
+/// Returns `Ok(count)` when every message was forwarded. Returns the ingress
+/// back when no listener is registered (gateway-only mode, or the channel
+/// server has not started yet) so the caller can dispatch through its own
+/// path. A listener that disappears mid-batch (daemon shutdown) returns the
+/// unforwarded remainder for the same fallback.
+#[cfg(feature = "channel-sendblue")]
+pub(crate) async fn try_forward_to_channel_server(
+    ingress: VerifiedWebhookMessages,
+) -> Result<usize, VerifiedWebhookMessages> {
+    let VerifiedWebhookMessages {
+        spec,
+        alias,
+        messages,
+    } = ingress;
+
+    let mut queue = messages.into_iter();
+    let mut forwarded = 0usize;
+    while let Some(msg) = queue.next() {
+        match zeroclaw_channels::sendblue::forward_inbound_to_listener(&alias, msg).await {
+            Ok(()) => forwarded += 1,
+            Err(unsent) => {
+                let mut remainder = vec![unsent];
+                remainder.extend(queue);
+                return Err(VerifiedWebhookMessages {
+                    spec,
+                    alias,
+                    messages: remainder,
+                });
+            }
+        }
+    }
+    Ok(forwarded)
+}
+
 /// Authenticate one inbound webhook request against its adapter's registered
 /// credential policy.
 ///

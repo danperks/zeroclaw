@@ -3720,6 +3720,20 @@ async fn process_sendblue_webhook(
     // on a reply. No-op unless the instance enables read receipts.
     sendblue.mark_read_for(verified.messages()).await;
 
+    // Prefer the channel server: it owns per-sender history, session
+    // persistence, and interrupt-on-new-message. Only when no listener is
+    // registered (gateway-only mode) does the stateless gateway chat below
+    // handle the message.
+    let verified = match webhook_ingress::try_forward_to_channel_server(verified).await {
+        Ok(forwarded) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "forwarded": forwarded})),
+            );
+        }
+        Err(verified) => verified,
+    };
+
     let channel_ref = sendblue_channel_ref(alias);
     let (agent_override, has_channel_bindings) = {
         let config = state.config.read();

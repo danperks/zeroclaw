@@ -16618,6 +16618,12 @@ pub struct SendblueConfig {
     #[serde(default)]
     pub read_receipts: bool,
 
+    /// When true, a newer message from the same sender cancels the in-flight
+    /// request and starts a fresh response with preserved history.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]

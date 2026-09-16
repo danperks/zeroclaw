@@ -435,6 +435,7 @@ const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 #[allow(clippy::struct_excessive_bools)]
 struct InterruptOnNewMessageConfig {
     telegram: bool,
+    sendblue: bool,
     slack: bool,
     discord: bool,
     mattermost: bool,
@@ -446,6 +447,7 @@ impl InterruptOnNewMessageConfig {
     fn enabled_for_channel(self, channel: &str) -> bool {
         match channel {
             "telegram" => self.telegram,
+            "sendblue" => self.sendblue,
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
@@ -464,6 +466,13 @@ fn interrupt_on_new_message_config(
             .telegram
             .get("default")
             .is_some_and(|tg| tg.interrupt_on_new_message),
+        // Sendblue is single-user iMessage; any configured alias opting in
+        // enables interrupts for the channel (the live alias is rarely
+        // literally "default").
+        sendblue: channels
+            .sendblue
+            .values()
+            .any(|sb| sb.interrupt_on_new_message),
         slack: channels
             .slack
             .get("default")
@@ -13663,6 +13672,7 @@ fn concurrent_persist_lock_serialization() {
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -15381,6 +15391,7 @@ temperature = 0.3
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -16338,6 +16349,7 @@ temperature = 0.3
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -16815,6 +16827,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -16914,6 +16927,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -17031,6 +17045,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -17152,6 +17167,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -18171,6 +18187,7 @@ api_key = "anthropic-key"
             prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -18277,6 +18294,7 @@ api_key = "anthropic-key"
             prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -20639,6 +20657,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -20728,6 +20747,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -20851,6 +20871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -20969,6 +20990,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21124,6 +21146,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21251,6 +21274,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21400,6 +21424,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21532,6 +21557,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21649,6 +21675,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21784,6 +21811,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -21943,6 +21971,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22123,6 +22152,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::clone(&prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22611,6 +22641,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22723,6 +22754,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22845,6 +22877,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -23215,6 +23248,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -23361,6 +23395,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: true,
                 slack: false,
                 discord: false,
@@ -23522,6 +23557,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: true,
                 discord: false,
@@ -23840,6 +23876,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: true,
                 slack: false,
                 discord: false,
@@ -23976,6 +24013,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -24462,6 +24500,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -24591,6 +24630,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -24724,6 +24764,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -24849,6 +24890,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -24974,6 +25016,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -25386,6 +25429,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28053,6 +28097,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28234,6 +28279,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(config.clone()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28754,6 +28800,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -29241,6 +29288,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -29398,6 +29446,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -32771,6 +32820,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -32888,6 +32938,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33052,6 +33103,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33359,6 +33411,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33514,6 +33567,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33661,6 +33715,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33828,6 +33883,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -34204,6 +34260,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_mattermost_when_true() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -34217,6 +34274,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_disabled_for_mattermost_by_default() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -34230,6 +34288,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_discord() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: true,
@@ -34243,6 +34302,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_whatsapp() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -34274,6 +34334,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -34395,6 +34456,7 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: true,
                 discord: false,

@@ -36,6 +36,41 @@ pub struct SendblueChannel {
 
 const SENDBLUE_API_BASE: &str = "https://api.sendblue.com/api";
 
+/// Per-alias inbound forwarders registered by webhook-mode `listen()`.
+///
+/// The gateway's `/sendblue` webhook handler and the channel server hold
+/// separate `SendblueChannel` instances, so without a bridge, webhook
+/// deliveries dispatch through the stateless gateway chat path — no
+/// per-sender history, no session persistence, no interrupt-on-new-message.
+/// Webhook-mode `listen()` registers its orchestrator queue here so the
+/// gateway can hand verified inbound messages to the channel server and get
+/// the full conversational treatment while keeping webhook latency.
+static INBOUND_FORWARDERS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ChannelMessage>>>,
+> = std::sync::OnceLock::new();
+
+fn inbound_forwarders()
+-> &'static Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ChannelMessage>>> {
+    INBOUND_FORWARDERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Forward one verified inbound message to the channel-server listener for
+/// `alias`, if one is registered. Returns the message back on failure so the
+/// caller can fall back to its own dispatch path.
+pub async fn forward_inbound_to_listener(
+    alias: &str,
+    msg: ChannelMessage,
+) -> Result<(), ChannelMessage> {
+    let sender = {
+        let forwarders = inbound_forwarders().lock();
+        forwarders.get(alias).cloned()
+    };
+    let Some(sender) = sender else {
+        return Err(msg);
+    };
+    sender.send(msg).await.map_err(|failed| failed.0)
+}
+
 /// How long a successful poll stays evidence that the listener works. A
 /// blackholed request keeps `listen()` alive with nothing to end it, so a
 /// stale success must stop counting.
@@ -146,12 +181,28 @@ impl SendblueChannel {
 
     /// Sendblue delivers a message's attachment as a single `media_url`
     /// rather than a typed parts array.
+    ///
+    /// iMessage rich-link previews arrive as `.pluginPayloadAttachment`
+    /// blobs — an Apple-internal serialization of the link card, not an
+    /// image any model can load. Dropping them keeps the shared URL (which
+    /// arrives as message text) as the thing the agent acts on, instead of
+    /// a broken attachment it fixates on. Real photos keep their normal
+    /// media extensions and pass through untouched.
     fn media_marker(payload: &serde_json::Value) -> Option<String> {
         let url = payload
             .get("media_url")
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
+
+        if url.ends_with(".pluginPayloadAttachment") {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping rich-link preview attachment"
+            );
+            return None;
+        }
 
         Some(format!("[IMAGE:{url}]"))
     }
@@ -496,6 +547,14 @@ impl Channel for SendblueChannel {
                 "channel active (webhook mode). \
                 Configure the Sendblue webhook to POST to your gateway's /sendblue endpoint."
             );
+
+            // Publish this listener's queue so the gateway webhook handler can
+            // route verified inbound messages through the channel server
+            // (per-sender history, session persistence, interrupts) instead of
+            // the stateless gateway chat path.
+            inbound_forwarders()
+                .lock()
+                .insert(self.alias.clone(), tx.clone());
 
             // Keep the task alive — it will be cancelled when the channel shuts down
             loop {
@@ -879,6 +938,35 @@ mod tests {
 
         assert_eq!(msgs.len(), 1, "an image with no caption is still a message");
         assert_eq!(msgs[0].content, "[IMAGE:https://cdn.sendblue.co/img.jpg]");
+    }
+
+    #[test]
+    fn drops_a_rich_link_preview_attachment_but_keeps_the_url_text() {
+        let mut payload = inbound("https://maps.app.goo.gl/abc123");
+        payload["media_url"] = serde_json::json!(
+            "https://storage.googleapis.com/inbound-file-store/x_ABC.pluginPayloadAttachment"
+        );
+
+        let msgs = allowed_channel().parse_webhook_payload(&payload);
+
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].content, "https://maps.app.goo.gl/abc123",
+            "the shared URL is the actionable part; the preview blob is not loadable"
+        );
+    }
+
+    #[test]
+    fn drops_a_preview_only_fragment_entirely() {
+        let mut payload = inbound("");
+        payload["media_url"] = serde_json::json!(
+            "https://storage.googleapis.com/inbound-file-store/x_ABC.pluginPayloadAttachment"
+        );
+
+        assert!(
+            allowed_channel().parse_webhook_payload(&payload).is_empty(),
+            "a preview blob with no text carries no user intent"
+        );
     }
 
     #[test]
