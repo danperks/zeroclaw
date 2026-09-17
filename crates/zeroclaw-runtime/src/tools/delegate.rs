@@ -41,6 +41,40 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
     crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
 }
 
+/// Detect a fabricated tool transcript in a delegate response.
+///
+/// Sub-agent turns invoke tools natively; the runtime never executes
+/// tool-call markup that arrives as text. So when a delegate's *response
+/// text* contains transcript markup, the model wrote both the call and the
+/// "result" itself — observed producing entirely invented locations
+/// (placeholder London coordinates, a fictional San Francisco address).
+/// Failing closed turns silent fiction into a visible failure the caller
+/// can relay honestly.
+fn fabricated_transcript_marker(response: &str) -> Option<&'static str> {
+    const MARKERS: &[&str] = &[
+        "<function_calls>",
+        "<function_response>",
+        "<function_results>",
+        "<tool_call>",
+        "<tool_response>",
+        "<tool_result>",
+        "<invoke name=",
+    ];
+    MARKERS
+        .iter()
+        .find(|marker| response.contains(**marker))
+        .copied()
+}
+
+fn fabricated_transcript_error(agent_name: &str, marker: &str) -> String {
+    format!(
+        "Agent '{agent_name}' returned text containing a tool transcript \
+         (`{marker}`) that was never executed — the content is fabricated \
+         and has been discarded. Report the failure honestly; do not invent \
+         a substitute answer."
+    )
+}
+
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
     if error
         .chain()
@@ -1970,12 +2004,21 @@ impl DelegateTool {
                     error: Some(invalid_semantic_completion_error(agent_name)),
                 }
             }
-            Ok(response) => ToolResult {
-                success: true,
-                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
-                    .into(),
-                error: None,
-            },
+            Ok(response) => {
+                if let Some(marker) = fabricated_transcript_marker(&response) {
+                    return ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(fabricated_transcript_error(agent_name, marker)),
+                    };
+                }
+                ToolResult {
+                    success: true,
+                    output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                        .into(),
+                    error: None,
+                }
+            }
             Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -3550,14 +3593,23 @@ impl DelegateTool {
                 output: ToolOutput::default(),
                 error: Some(invalid_semantic_completion_error(agent_name)),
             }),
-            Ok(Ok(response)) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
-                )
-                .into(),
-                error: None,
-            }),
+            Ok(Ok(response)) => {
+                if let Some(marker) = fabricated_transcript_marker(&response) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(fabricated_transcript_error(agent_name, marker)),
+                    });
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                    )
+                    .into(),
+                    error: None,
+                })
+            }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -6924,13 +6976,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success);
+        // Text-form tool markup in a delegate response is never executed, so
+        // passing it through verbatim hands the caller a fabricated
+        // transcript. The delegate now fails closed instead (observed live:
+        // invented locations backed by fake tool "results").
         assert!(
-            result.output.contains("<tool_call>"),
-            "strict subagent should return fallback-looking text unchanged"
+            !result.success,
+            "fabricated tool transcript must fail the delegation"
+        );
+        let error = result.error.expect("fail-closed result carries an error");
+        assert!(
+            error.contains("fabricated"),
+            "error should say the content was fabricated: {error}"
         );
         assert!(
-            !result.output.contains("echo:ignored"),
+            !error.contains("echo:ignored"),
             "strict subagent must not execute text fallback tool calls"
         );
     }
