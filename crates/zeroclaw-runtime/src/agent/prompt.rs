@@ -477,7 +477,14 @@ impl PromptSection for DateTimeSection {
              The following is the ABSOLUTE TRUTH regarding the current date. \
              Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
              Date: {year:04}-{month:02}-{day:02}\n\
-             UTC offset: {}",
+             UTC offset: {}\n\n\
+             Conversation messages and recalled memories carry their own \
+             timestamps. Relative words inside them (\"tomorrow\", \"tonight\", \
+             \"next week\") are anchored to those timestamps, not to now — a plan \
+             recorded yesterday as \"tomorrow\" means today. Reconcile against \
+             the current date and message timestamps before repeating any \
+             relative phrasing, and notice when significant time has passed \
+             since the previous message.",
             now.format("%:z")
         ))
     }

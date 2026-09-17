@@ -220,6 +220,28 @@ pub fn resolve_inject_policy(
 
 /// The uniform skip set: entries no path wants in a preamble. Union of the
 /// legacy renderers' filters (the channel renderer's set was the widest).
+/// `"[recorded 2026-09-16, yesterday] "` for a memory's RFC 3339 timestamp.
+///
+/// Memories freeze relative time: "going to Como tomorrow" saved on Tuesday
+/// reads as a current fact on Wednesday unless the model can see when it was
+/// recorded. Empty when the timestamp doesn't parse — a malformed row should
+/// degrade to the old unstamped line, not lose the memory.
+fn recorded_stamp(timestamp: &str) -> Option<String> {
+    let recorded = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let days = (chrono::Utc::now() - recorded.with_timezone(&chrono::Utc)).num_days();
+    let age = match days {
+        d if d <= 0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        d if d < 14 => format!("{d} days ago"),
+        d if d < 70 => format!("{} weeks ago", d / 7),
+        d => format!("{} months ago", d / 30),
+    };
+    Some(format!(
+        "[recorded {}, {age}] ",
+        recorded.format("%Y-%m-%d")
+    ))
+}
+
 fn should_skip_entry(key: &str, content: &str) -> bool {
     if zeroclaw_memory::is_assistant_autosave_key(key) {
         return true;
@@ -359,7 +381,13 @@ pub async fn render_memory_context(
         };
 
         let mut line = String::new();
-        let _ = writeln!(line, "- {}: {}", entry.key, content);
+        let _ = writeln!(
+            line,
+            "- {}{}: {}",
+            recorded_stamp(&entry.timestamp).unwrap_or_default(),
+            entry.key,
+            content
+        );
         let line_chars = line.chars().count();
         if used_chars + line_chars > cfg.max_total_chars {
             break;
@@ -681,7 +709,7 @@ mod tests {
         .await;
 
         assert!(context.starts_with(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("- user_preference: prefers concise answers"));
+        assert!(context.contains("] user_preference: prefers concise answers"));
         assert!(context.ends_with(&format!("{MEMORY_CONTEXT_CLOSE}\n\n")));
         assert_eq!(observer.recalls.lock().as_slice(), &[(1, true)]);
     }
@@ -820,7 +848,7 @@ mod tests {
         .await;
 
         assert!(!context.contains("said hi earlier"));
-        assert!(context.contains("- fact: server is prod-3"));
+        assert!(context.contains("] fact: server is prod-3"));
     }
 
     #[tokio::test]
@@ -862,7 +890,7 @@ mod tests {
         assert!(!context.contains("transcript blob"));
         assert!(!context.contains("[IMAGE:"));
         assert!(!context.contains("<tool_result"));
-        assert!(context.contains("- keeper: real knowledge"));
+        assert!(context.contains("] keeper: real knowledge"));
     }
 
     #[tokio::test]
@@ -895,8 +923,8 @@ mod tests {
         .await;
 
         assert!(!context.contains("barely related"));
-        assert!(context.contains("- high: very related"));
-        assert!(context.contains("- unscored: keyword backend"));
+        assert!(context.contains("] high: very related"));
+        assert!(context.contains("] unscored: keyword backend"));
     }
 
     #[tokio::test]
@@ -928,8 +956,8 @@ mod tests {
         .await;
 
         // Entry cap: 4 of the 5 render.
-        assert!(context.contains("- d: four"));
-        assert!(!context.contains("- e: five"));
+        assert!(context.contains("] d: four"));
+        assert!(!context.contains("] e: five"));
         // Per-entry cap: the 900-char content is ellipsis-truncated.
         assert!(context.contains("..."));
         assert!(!context.contains(&long));
@@ -965,9 +993,9 @@ mod tests {
         )
         .await;
 
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(!context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(!context.contains("] c: "));
     }
 
     #[tokio::test]
@@ -1007,10 +1035,10 @@ mod tests {
         .await;
 
         // First scope wins the duplicate key; both uniques render; one event.
-        assert!(context.contains("- shared: from history scope"));
+        assert!(context.contains("] shared: from history scope"));
         assert!(!context.contains("from sender scope"));
-        assert!(context.contains("- only_first: h"));
-        assert!(context.contains("- only_sender: s"));
+        assert!(context.contains("] only_first: h"));
+        assert!(context.contains("] only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
     }
 
@@ -1063,7 +1091,7 @@ mod tests {
         )
         .await;
 
-        assert!(first.contains("- fact: server is prod-3"));
+        assert!(first.contains("] fact: server is prod-3"));
         assert_eq!(
             first, second,
             "direct backend recall must render identically"
@@ -1191,41 +1219,87 @@ mod tests {
     // Flags-off goldens: captured from the pre-rerank renderer's behavior on
     // the corpus (decay drops `stale`, the skip set drops `user_msg_9`, the
     // near-duplicate pair renders twice, recall order is preserved). Later
-    // pipeline stages re-prove against these.
-    const GOLDEN_FULL: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - chat: user said hello\n\
-        [/Memory context]\n\n";
-    const GOLDEN_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        [/Memory context]\n\n";
-    const GOLDEN_TIGHT_BUDGET: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        [/Memory context]\n\n";
+    // pipeline stages re-prove against these. Rendered lines carry the
+    // recorded-stamp prefix, whose date is dynamic, so the goldens are
+    // computed rather than literal.
+    fn stamp_today() -> String {
+        format!("[recorded {}, today] ", chrono::Utc::now().format("%Y-%m-%d"))
+    }
+    fn stamp_60d() -> String {
+        let d = chrono::Utc::now() - chrono::Duration::days(60);
+        format!("[recorded {}, 8 weeks ago] ", d.format("%Y-%m-%d"))
+    }
+    fn golden_full() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             - {s}alpha_dup: deploy target is prod-cluster-3 for staging\n\
+             - {s}beta: team standup moved to 0930\n\
+             - {s}chat: user said hello\n\
+             [/Memory context]\n\n"
+        )
+    }
+    fn golden_no_conversation() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             - {s}alpha_dup: deploy target is prod-cluster-3 for staging\n\
+             - {s}beta: team standup moved to 0930\n\
+             [/Memory context]\n\n"
+        )
+    }
+    // The recorded-stamp prefix counts against max_total_chars, so the
+    // 100-char budget now fits a single stamped line.
+    fn golden_tight_chars() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             [/Memory context]\n\n"
+        )
+    }
+    fn golden_tight_budget() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             - {s}alpha_dup: deploy target is prod-cluster-3 for staging\n\
+             [/Memory context]\n\n"
+        )
+    }
     // Rerank arm on the same corpus: the blend re-sorts, MMR demotes the
     // near-duplicate to the tail, the trim drops the unscored Conversation
     // entry, and `stale` survives (the blend's recency factor replaces the
     // decay drop). Divergence from the flags-off goldens is the point.
-    const GOLDEN_RERANK: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        [/Memory context]\n\n";
+    fn golden_rerank() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             - {s}beta: team standup moved to 0930\n\
+             - {}stale: quarterly report workflow uses legacy tool\n\
+             - {s}alpha_dup: deploy target is prod-cluster-3 for staging\n\
+             [/Memory context]\n\n",
+            stamp_60d()
+        )
+    }
     // Conversation exclusion is an eligibility boundary, so it runs before
     // duplicate collapse and MMR. Once the ineligible rows are removed, this
     // fixture is below the advanced-strategy threshold and keeps blend order.
-    const GOLDEN_RERANK_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
-        [/Memory context]\n\n";
+    fn golden_rerank_no_conversation() -> String {
+        let s = stamp_today();
+        format!(
+            "[Memory context]\n\
+             - {s}alpha: deploy target is prod-cluster-3\n\
+             - {s}alpha_dup: deploy target is prod-cluster-3 for staging\n\
+             - {s}beta: team standup moved to 0930\n\
+             - {}stale: quarterly report workflow uses legacy tool\n\
+             [/Memory context]\n\n",
+            stamp_60d()
+        )
+    }
 
     #[tokio::test]
     async fn injection_goldens_across_origin_budget_and_flags() {
@@ -1242,14 +1316,14 @@ mod tests {
             DEFAULT_RECALL_LIMIT,
         );
 
-        let cases: Vec<(&str, TurnOrigin, bool, bool, MemoryInjectConfig, &str)> = vec![
+        let cases: Vec<(&str, TurnOrigin, bool, bool, MemoryInjectConfig, String)> = vec![
             (
                 "interactive_scoped",
                 TurnOrigin::Interactive,
                 true,
                 false,
                 flags_off,
-                GOLDEN_FULL,
+                golden_full(),
             ),
             (
                 "channel_unscoped_excludes_conversation",
@@ -1257,7 +1331,7 @@ mod tests {
                 false,
                 false,
                 flags_off,
-                GOLDEN_NO_CONVERSATION,
+                golden_no_conversation(),
             ),
             (
                 "cron_excludes_conversation",
@@ -1265,7 +1339,7 @@ mod tests {
                 true,
                 false,
                 flags_off,
-                GOLDEN_NO_CONVERSATION,
+                golden_no_conversation(),
             ),
             (
                 "daemon_excludes_conversation",
@@ -1273,7 +1347,7 @@ mod tests {
                 false,
                 false,
                 flags_off,
-                GOLDEN_NO_CONVERSATION,
+                golden_no_conversation(),
             ),
             (
                 "sub_turn_never_injects",
@@ -1281,7 +1355,7 @@ mod tests {
                 true,
                 false,
                 flags_off,
-                "",
+                String::new(),
             ),
             // The cron `uses_memory = false` spawn-site opt-out arrives here
             // as `suppress`, so the whole render is skipped.
@@ -1291,7 +1365,7 @@ mod tests {
                 true,
                 true,
                 flags_off,
-                "",
+                String::new(),
             ),
             (
                 "tight_entry_budget",
@@ -1302,7 +1376,7 @@ mod tests {
                     max_entries: 2,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                golden_tight_budget(),
             ),
             (
                 "tight_total_char_budget",
@@ -1313,7 +1387,7 @@ mod tests {
                     max_total_chars: 100,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                golden_tight_chars(),
             ),
             (
                 "rerank_on_interactive",
@@ -1321,7 +1395,7 @@ mod tests {
                 true,
                 false,
                 rerank_on,
-                GOLDEN_RERANK,
+                golden_rerank(),
             ),
             (
                 "rerank_on_cron",
@@ -1329,7 +1403,7 @@ mod tests {
                 true,
                 false,
                 rerank_on,
-                GOLDEN_RERANK_NO_CONVERSATION,
+                golden_rerank_no_conversation(),
             ),
         ];
 
@@ -1391,9 +1465,9 @@ mod tests {
             },
         )
         .await;
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(context.contains("] c: "));
 
         // Rerank on with a 2-slot trim: MMR demotes the near-duplicate below
         // the unrelated entry and the trim drops it.
@@ -1429,11 +1503,11 @@ mod tests {
             },
         )
         .await;
-        let a_pos = context.find("- a: ").expect("top entry renders");
-        let c_pos = context.find("- c: ").expect("diverse entry renders");
+        let a_pos = context.find("] a: ").expect("top entry renders");
+        let c_pos = context.find("] c: ").expect("diverse entry renders");
         assert!(a_pos < c_pos, "relevance leader stays first");
         assert!(
-            !context.contains("- b: "),
+            !context.contains("] b: "),
             "near-duplicate must be demoted out of the trimmed set"
         );
     }
@@ -1740,7 +1814,7 @@ mod tests {
             !context.contains("channel_history"),
             "ineligible row dropped"
         );
-        assert!(context.contains("- fact_e: epsilon elderberry"));
+        assert!(context.contains("] fact_e: epsilon elderberry"));
     }
 
     /// Composed score-domain regression: current SQLite recall owns BM25
@@ -1818,10 +1892,10 @@ mod tests {
         .await;
 
         let best = context
-            .find("- best_match: ")
+            .find("] best_match: ")
             .expect("the relevance leader survives the configured floor");
         let supporting = context
-            .find("- supporting_match: ")
+            .find("] supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
     }
