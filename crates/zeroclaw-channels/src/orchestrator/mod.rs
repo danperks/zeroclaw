@@ -51233,6 +51233,38 @@ This is an example JSON object for profile settings."#;
     /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
     /// This previously resolved to `false` because the lookup hardcoded the
     /// literal key `"default"`.
+    /// Enabling interrupts on one Sendblue alias must not enable them on
+    /// another alias that left the option off.
+    #[test]
+    fn interrupt_on_new_message_resolves_per_sendblue_alias() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        for (alias, interrupt) in [("on", true), ("off", false)] {
+            config.channels.sendblue.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::SendblueConfig {
+                    interrupt_on_new_message: interrupt,
+                    ..Default::default()
+                },
+            );
+        }
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = |alias: &str| zeroclaw_api::channel::ChannelMessage {
+            channel: "sendblue".to_string(),
+            channel_alias: Some(alias.to_string()),
+            ..Default::default()
+        };
+
+        assert!(interrupt_on_new_message_enabled(&ctx, &msg("on")));
+        assert!(!interrupt_on_new_message_enabled(&ctx, &msg("off")));
+    }
+
     #[test]
     fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
         let mut channels = zeroclaw_config::schema::ChannelsConfig::default();

@@ -414,14 +414,6 @@ impl VerifiedWebhookMessages {
         self.messages.is_empty()
     }
 
-    /// Read-only view of the verified messages, for adapters that need to act
-    /// on the parsed set before dispatch. Borrowed rather than moved so the
-    /// proof still owns them when it is handed to the dispatcher.
-    #[cfg(feature = "channel-sendblue")]
-    pub(crate) fn messages(&self) -> &[ChannelMessage] {
-        &self.messages
-    }
-
     /// Remove messages handled entirely by the transport adapter, such as
     /// WhatsApp approval replies. This can narrow the parsed set but cannot
     /// introduce content that did not come from the verified body.
@@ -430,11 +422,13 @@ impl VerifiedWebhookMessages {
         self.messages.retain(keep);
     }
 
-    /// Read-only access for adapter-owned asynchronous interception before the
-    /// verified set is narrowed with [`Self::retain`].
-    #[cfg(feature = "channel-whatsapp-cloud")]
-    pub(crate) fn messages(&self) -> impl Iterator<Item = &ChannelMessage> {
-        self.messages.iter()
+    /// Read-only view of the verified messages, for adapters that act on the
+    /// parsed set before dispatch (WhatsApp's interception ahead of
+    /// [`Self::retain`], Sendblue's read receipts). Borrowed rather than moved
+    /// so the proof still owns them when it is handed to the dispatcher.
+    #[cfg(any(feature = "channel-sendblue", feature = "channel-whatsapp-cloud"))]
+    pub(crate) fn messages(&self) -> &[ChannelMessage] {
+        &self.messages
     }
 }
 
@@ -445,15 +439,14 @@ impl VerifiedWebhookMessages {
 /// system prompt and the current message), which is the right shape for the
 /// `/webhook` API but loses conversation continuity for a messaging channel.
 ///
-/// Returns `Ok(count)` when every message was forwarded. Returns the ingress
-/// back when no listener is registered (gateway-only mode, or the channel
-/// server has not started yet) so the caller can dispatch through its own
-/// path. A listener that disappears mid-batch (daemon shutdown) returns the
-/// unforwarded remainder for the same fallback.
+/// Admission never waits, so nothing between the caller's de-duplication claim
+/// and this decision can be cancelled by the request deadline.
 #[cfg(feature = "channel-sendblue")]
-pub(crate) async fn try_forward_to_channel_server(
+pub(crate) fn try_forward_to_channel_server(
     ingress: VerifiedWebhookMessages,
-) -> Result<usize, VerifiedWebhookMessages> {
+) -> Result<usize, ForwardFailure> {
+    use zeroclaw_channels::sendblue::ForwardError;
+
     let VerifiedWebhookMessages {
         spec,
         alias,
@@ -463,20 +456,37 @@ pub(crate) async fn try_forward_to_channel_server(
     let mut queue = messages.into_iter();
     let mut forwarded = 0usize;
     while let Some(msg) = queue.next() {
-        match zeroclaw_channels::sendblue::forward_inbound_to_listener(&alias, msg).await {
+        match zeroclaw_channels::sendblue::forward_inbound_to_listener(&alias, msg) {
             Ok(()) => forwarded += 1,
-            Err(unsent) => {
-                let mut remainder = vec![unsent];
+            Err(ForwardError::QueueFull(unsent)) => {
+                let mut remainder = vec![*unsent];
                 remainder.extend(queue);
-                return Err(VerifiedWebhookMessages {
+                return Err(ForwardFailure::QueueFull(remainder));
+            }
+            Err(ForwardError::NoListener(unsent)) => {
+                let mut remainder = vec![*unsent];
+                remainder.extend(queue);
+                return Err(ForwardFailure::NoListener(VerifiedWebhookMessages {
                     spec,
                     alias,
                     messages: remainder,
-                });
+                }));
             }
         }
     }
     Ok(forwarded)
+}
+
+/// Messages [`try_forward_to_channel_server`] could not hand to the channel
+/// server. Earlier messages in the batch may already have been forwarded.
+#[cfg(feature = "channel-sendblue")]
+pub(crate) enum ForwardFailure {
+    /// No live listener (gateway-only mode, the channel server has not started
+    /// yet, or it is shutting down). The caller dispatches these itself.
+    NoListener(VerifiedWebhookMessages),
+    /// The listener's queue is full. Nothing here was admitted; the caller
+    /// releases their claims and asks the provider to retry.
+    QueueFull(Vec<ChannelMessage>),
 }
 
 /// Authenticate one inbound webhook request against its adapter's registered
@@ -559,15 +569,11 @@ pub(crate) fn authenticate(
 ))]
 pub(crate) enum WebhookDispatchMode {
     /// Process every message before acknowledging the webhook.
-    #[cfg(any(
-        feature = "channel-linq",
-        feature = "channel-sendblue",
-        feature = "channel-whatsapp-cloud"
-    ))]
+    #[cfg(any(feature = "channel-linq", feature = "channel-whatsapp-cloud"))]
     Synchronous,
     /// Acknowledge immediately and process each message in a background
     /// task, for providers that cancel slow webhook deliveries.
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-sendblue"))]
     FastAck,
 }
 
@@ -621,11 +627,7 @@ pub(crate) async fn dispatch_verified_webhook(
     } = ingress;
 
     match ctx.mode {
-        #[cfg(any(
-            feature = "channel-linq",
-            feature = "channel-sendblue",
-            feature = "channel-whatsapp-cloud"
-        ))]
+        #[cfg(any(feature = "channel-linq", feature = "channel-whatsapp-cloud"))]
         WebhookDispatchMode::Synchronous => {
             for msg in &messages {
                 process_verified_message(
@@ -642,7 +644,7 @@ pub(crate) async fn dispatch_verified_webhook(
                 .await;
             }
         }
-        #[cfg(feature = "channel-nextcloud")]
+        #[cfg(any(feature = "channel-nextcloud", feature = "channel-sendblue"))]
         WebhookDispatchMode::FastAck => {
             // The provider cancels webhook requests that do not complete
             // quickly; slow local models routinely exceed that. Each message

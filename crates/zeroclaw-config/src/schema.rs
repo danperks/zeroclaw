@@ -18368,17 +18368,17 @@ pub struct SendblueConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub from_number: String,
-    /// Shared secret presented by inbound webhooks.
+    /// Shared secret for inbound webhooks, configured on both ends.
     ///
-    /// Required to receive webhooks. Sendblue does not sign its deliveries, so
-    /// unlike the signature-verified channels there is nothing to recompute
-    /// from the body: the gateway can only compare a shared secret the
-    /// operator configures on both ends. With no secret configured the
-    /// gateway refuses inbound requests with `401` rather than accepting them
-    /// unauthenticated.
+    /// Required to receive webhooks. A delivery carrying
+    /// `X-Sendblue-Signature` is verified as an HMAC over the raw body with a
+    /// five-minute freshness window; otherwise the gateway compares the
+    /// `sb-signing-secret` echo that message webhooks send. With no secret
+    /// configured the gateway refuses inbound requests with `401` rather than
+    /// accepting them unauthenticated.
     ///
-    /// Because the secret is not bound to the request body, a captured header
-    /// can be replayed with forged content. Terminate the endpoint over TLS.
+    /// The echo is not bound to the request body, so a captured header can be
+    /// replayed with forged content. Terminate the endpoint over TLS.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -18390,7 +18390,7 @@ pub struct SendblueConfig {
     ///
     /// Polling is the default because it needs nothing but the API credentials
     /// — no publicly reachable endpoint, and none of the replay exposure that
-    /// comes with Sendblue's unsigned webhooks.
+    /// comes with the webhook secret echo.
     #[tab(Advanced)]
     #[serde(default = "default_sendblue_poll_interval_secs")]
     pub poll_interval_secs: u64,

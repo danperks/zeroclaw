@@ -42,9 +42,15 @@ The channel polls `GET /api/v2/messages` every `poll_interval_secs` (default
 credentials: no publicly reachable endpoint, no webhook configured in the
 Sendblue dashboard, and none of the replay exposure below.
 
+Each poll asks the API for inbound messages to this alias's `from_number`
+only, oldest first, and pages through the whole window before moving its
+cursor, so outbound traffic or a burst of inbound cannot push a message out of
+reach. A backlog larger than ten pages is finished on later polls rather than
+skipped. Each poll re-reads the last minute to absorb clock skew between
+Sendblue and the host, and those repeats are dropped on `message_handle`.
+
 Only messages that arrive after the listener starts are dispatched, so a
-restart does not re-answer the account's backlog. `created_at_gte` is
-inclusive, so the boundary message is de-duplicated on its `message_handle`.
+restart does not re-answer the account's backlog.
 
 ### Inbound: webhook (opt-in)
 
@@ -87,9 +93,21 @@ get depends on the webhook type:
 > route refuses inbound requests with `401` rather than accepting them
 > unauthenticated.
 
+Sendblue webhooks are registered per account, not per line, so every
+alias's route receives every line's traffic and accepts only messages to its
+own `from_number`. With more than one alias, register `/sendblue/<alias>` for
+each; the bare `/sendblue` path is refused when it cannot tell aliases apart.
+
+The gateway acknowledges a delivery as soon as each message has been handed
+to the channel server's queue, or to a background task when the gateway runs
+without a channel server, so a slow agent turn does not outlive the request.
+If the channel server's queue is full the route answers `503` and Sendblue
+retries.
+
 Sendblue re-delivers any webhook it did not get a 2xx for, so deliveries are
-de-duplicated on `message_handle` before dispatch. That record is shared with
-the poller, so switching modes or running a retry cannot double-answer.
+de-duplicated on `message_handle` before dispatch, and an event without a
+`message_handle` is dropped. The record is in memory, per channel instance:
+it does not survive a restart and is not shared with the poller.
 
 Group messages (`group_id` set) and delivery-status callbacks (`status` other
 than `RECEIVED`) are acknowledged without dispatch. Replying to a group would
@@ -105,8 +123,9 @@ agent is still composing. One receipt per conversation, not per message.
 Off by default, because Sendblue gates `POST /api/mark-read` per account:
 their engineering team has to enable read receipts on your line before it
 serves anything. Receipts are best-effort with no delivery confirmation, and
-iMessage/RCS only, since SMS carries no read state. Failures are logged at
-debug and never hold up the inbound message.
+iMessage/RCS only, since SMS carries no read state. Each receipt runs in the
+background with a ten-second deadline; failures are logged at debug and never
+hold up the inbound message.
 
 Sendblue can also do this server-side with its account-level auto-mark-read
 setting, which fires on every inbound 1:1 iMessage and needs nothing here.

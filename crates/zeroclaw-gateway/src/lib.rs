@@ -745,9 +745,8 @@ pub struct AppState {
     /// Sendblue channel instances keyed by config alias.
     #[cfg(feature = "channel-sendblue")]
     pub sendblue: HashMap<String, Arc<SendblueChannel>>,
-    /// Sendblue webhook shared secrets per alias. Sendblue does not sign its
-    /// deliveries, so this is compared against a request header rather than
-    /// used to recompute a signature over the body.
+    /// Sendblue webhook shared secrets per alias: the HMAC key for signed
+    /// deliveries, and the expected `sb-signing-secret` echo otherwise.
     #[cfg(feature = "channel-sendblue")]
     pub sendblue_signing_secrets: HashMap<String, Arc<str>>,
     /// Nextcloud Talk channel instances keyed by config alias.
@@ -3078,7 +3077,11 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
 
 #[cfg(all(
     test,
-    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+    any(
+        feature = "channel-linq",
+        feature = "channel-sendblue",
+        feature = "channel-whatsapp-cloud"
+    )
 ))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
@@ -4646,6 +4649,19 @@ async fn handle_sendblue_webhook_impl(
     let Some((alias_key, sendblue)) = resolved.entry() else {
         return api_webhook::not_found("sendblue");
     };
+    // Sendblue webhooks are account wide, so with more than one line the bare
+    // path cannot know which alias a delivery belongs to, and guessing the
+    // first one would acknowledge other lines' messages without answering.
+    if resolved.is_fallback() && state.sendblue.len() > 1 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "sendblue"})),
+            "Sendblue webhook refused on the bare path: several aliases are configured, register /sendblue/<alias> for each"
+        );
+        return api_webhook::not_found("sendblue");
+    }
     let signing_secret = state.sendblue_signing_secrets.get(alias_key).cloned();
     let resp = process_sendblue_webhook(
         &state,
@@ -4660,11 +4676,13 @@ async fn handle_sendblue_webhook_impl(
 }
 
 /// Verify, parse, and dispatch a Sendblue webhook payload for one resolved
-/// instance. `signing_secret` is that instance's shared secret.
+/// instance. `signing_secret` is that instance's shared secret, checked as an
+/// HMAC signature over the raw body when the delivery carries one, otherwise
+/// as the `sb-signing-secret` echo.
 ///
-/// Sendblue does not sign its webhook deliveries, so unlike Linq there is no
-/// signature to recompute over the body — the verifier compares the shared
-/// secret presented in a request header.
+/// Every accepted message is either admitted to a queue or a background task
+/// before the response, with no await between claiming its handle and that
+/// admission, so the gateway request deadline cannot strand a claimed message.
 #[cfg(feature = "channel-sendblue")]
 async fn process_sendblue_webhook(
     state: &AppState,
@@ -4710,23 +4728,41 @@ async fn process_sendblue_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Ahead of ownership resolution and dispatch: the point of the receipt is
-    // that the sender sees the message landed while the agent is still working
-    // on a reply. No-op unless the instance enables read receipts.
-    sendblue.mark_read_for(verified.messages()).await;
+    // Background tasks, so the sender sees the message landed while the agent
+    // is still working. No-op unless the instance enables read receipts.
+    sendblue.spawn_read_receipts(verified.messages());
 
     // Prefer the channel server: it owns per-sender history, session
     // persistence, and interrupt-on-new-message. Only when no listener is
     // registered (gateway-only mode) does the stateless gateway chat below
     // handle the message.
-    let verified = match webhook_ingress::try_forward_to_channel_server(verified).await {
+    let verified = match webhook_ingress::try_forward_to_channel_server(verified) {
         Ok(forwarded) => {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "ok", "forwarded": forwarded})),
             );
         }
-        Err(verified) => verified,
+        Err(webhook_ingress::ForwardFailure::QueueFull(unsent)) => {
+            let handles: Vec<String> = unsent.into_iter().map(|msg| msg.id).collect();
+            sendblue.release(&handles);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Defer)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "channel": "sendblue",
+                        "alias": alias,
+                        "deferred": handles.len(),
+                    })),
+                "Sendblue webhook deferred: channel queue is full, asking Sendblue to retry"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "channel queue full; retry later"})),
+            );
+        }
+        Err(webhook_ingress::ForwardFailure::NoListener(verified)) => verified,
     };
 
     let channel_ref = sendblue_channel_ref(alias);
@@ -4762,7 +4798,7 @@ async fn process_sendblue_webhook(
             channel,
             memory_key: sendblue_memory_key,
             agent_override,
-            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            mode: webhook_ingress::WebhookDispatchMode::FastAck,
             #[cfg(test)]
             suppress_reply_send: true,
         },
@@ -13217,6 +13253,7 @@ data: [DONE]\n\n";
             "message_handle": "msg-123",
             "from_number": sender,
             "to_number": "+15550000000",
+            "sendblue_number": "+15550000000",
             "content": text,
             "is_outbound": false,
             "status": "RECEIVED",
@@ -13239,24 +13276,42 @@ data: [DONE]\n\n";
         signing_secret: Option<&str>,
         config: Config,
     ) -> AppState {
-        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        sendblue_test_state_with_lines(
+            &[(alias, "+15550000000")],
+            signing_secret,
+            config,
+            Arc::new(MockModelProvider::default()),
+        )
+    }
+
+    /// Helper: one Sendblue channel per `(alias, line)`, all sharing
+    /// `signing_secret`, the way aliases on one Sendblue account share the
+    /// account-wide webhook traffic.
+    #[cfg(feature = "channel-sendblue")]
+    fn sendblue_test_state_with_lines(
+        lines: &[(&str, &str)],
+        signing_secret: Option<&str>,
+        config: Config,
+        model_provider: Arc<dyn ModelProvider>,
+    ) -> AppState {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-            Arc::new(|| vec!["*".to_string()]);
-        let channel = Arc::new(SendblueChannel::new(
-            "test-key-id".into(),
-            "test-secret-key".into(),
-            "+15550000000".into(),
-            alias,
-            peer_resolver,
-        ));
         let mut sendblue = HashMap::new();
-        sendblue.insert(alias.to_string(), channel);
-
         let mut sendblue_signing_secrets: HashMap<String, Arc<str>> = HashMap::new();
-        if let Some(secret) = signing_secret {
-            sendblue_signing_secrets.insert(alias.to_string(), Arc::from(secret));
+        for (alias, line) in lines {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(|| vec!["*".to_string()]);
+            let channel = Arc::new(SendblueChannel::new(
+                "test-key-id".into(),
+                "test-secret-key".into(),
+                (*line).to_string(),
+                *alias,
+                peer_resolver,
+            ));
+            sendblue.insert((*alias).to_string(), channel);
+            if let Some(secret) = signing_secret {
+                sendblue_signing_secrets.insert((*alias).to_string(), Arc::from(secret));
+            }
         }
 
         AppState {
@@ -13353,8 +13408,8 @@ data: [DONE]\n\n";
     #[cfg(feature = "channel-sendblue")]
     #[tokio::test]
     async fn sendblue_webhook_rejects_when_no_shared_secret_is_configured() {
-        // Sendblue does not sign deliveries, so an unset secret leaves nothing
-        // to authenticate with. Fail closed rather than accepting the request.
+        // Both the signature and the echo need the secret, so an unset one
+        // leaves nothing to authenticate with. Fail closed.
         let state = sendblue_test_state("main", None);
 
         let response = Box::pin(handle_sendblue_webhook_alias(
@@ -13553,6 +13608,237 @@ data: [DONE]\n\n";
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[derive(Default)]
+    struct SlowModelProvider {
+        calls: AtomicUsize,
+        completed: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[async_trait]
+    impl ModelProvider for SlowModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".into())
+        }
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    impl ::zeroclaw_api::attribution::Attributable for SlowModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SlowModelProvider"
+        }
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_turn_outlives_the_request_deadline_and_replies_once() {
+        // A turn slower than the request deadline must neither be cancelled
+        // with the request nor be re-run when Sendblue retries the delivery.
+        let provider = Arc::new(SlowModelProvider::default());
+        let state = sendblue_test_state_with_lines(
+            &[("deadline", "+15550000000")],
+            Some("correct-secret"),
+            Config::default(),
+            provider.clone(),
+        );
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&sendblue_webhook_body("+15551234567", "slow turn")).unwrap();
+        payload["message_handle"] = serde_json::json!("deadline-handle");
+        let body = payload.to_string();
+        let post = || {
+            Box::pin(handle_sendblue_webhook_alias(
+                State(state.clone()),
+                Path("deadline".to_string()),
+                sendblue_secret_headers("correct-secret"),
+                Bytes::from(body.clone()),
+            ))
+        };
+
+        let first = tokio::time::timeout(Duration::from_millis(200), post())
+            .await
+            .expect("the delivery is acknowledged well inside the request deadline")
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let retry = post().await.into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.completed.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the accepted turn runs to completion after the response");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the retry of an admitted message must not start a second turn"
+        );
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_defers_when_the_channel_queue_is_full_then_admits_the_retry() {
+        let alias = "queue-full";
+        let state = sendblue_test_state_with_lines(
+            &[(alias, "+15550000000")],
+            Some("correct-secret"),
+            Config::default(),
+            Arc::new(MockModelProvider::default()),
+        );
+        let listener_channel = Arc::new(SendblueChannel::new(
+            "test-key-id".into(),
+            "test-secret-key".into(),
+            "+15550000000".into(),
+            alias,
+            Arc::new(|| vec!["*".to_string()]),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let filler_tx = tx.clone();
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        let mut filler: serde_json::Value =
+            serde_json::from_str(&sendblue_webhook_body("+15551234567", "filler")).unwrap();
+        filler["message_handle"] = serde_json::json!("filler-handle");
+        let filler = state.sendblue[alias]
+            .parse_webhook_payload(&filler)
+            .remove(0);
+        filler_tx.send(filler).await.unwrap();
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&sendblue_webhook_body("+15551234567", "queued")).unwrap();
+        payload["message_handle"] = serde_json::json!("queued-handle");
+        let body = payload.to_string();
+        let post = || {
+            Box::pin(handle_sendblue_webhook_alias(
+                State(state.clone()),
+                Path(alias.to_string()),
+                sendblue_secret_headers("correct-secret"),
+                Bytes::from(body.clone()),
+            ))
+        };
+
+        let mut deferred = post().await.into_response();
+        for _ in 0..100 {
+            if deferred.status() == StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            // The listener may not have registered its forwarder yet, in which
+            // case the gateway dispatches the message itself.
+            assert_eq!(deferred.status(), StatusCode::OK);
+            state.sendblue[alias].release(&["queued-handle".to_string()]);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            deferred = post().await.into_response();
+        }
+        assert_eq!(
+            deferred.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a full queue asks Sendblue to retry instead of waiting out the deadline"
+        );
+
+        assert_eq!(rx.recv().await.unwrap().content, "filler");
+        let admitted = post().await.into_response();
+        assert_eq!(
+            admitted.status(),
+            StatusCode::OK,
+            "the deferred handle was released, so the retry is admitted"
+        );
+        assert_eq!(rx.recv().await.unwrap().content, "queued");
+
+        listener.abort();
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_does_not_dispatch_another_lines_message() {
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        // Sendblue webhooks are account wide, so alias B's route also receives
+        // line A's traffic.
+        let state = sendblue_test_state_with_lines(
+            &[("line-a", "+15550000000"), ("line-b", "+15550002222")],
+            Some("correct-secret"),
+            Config::default(),
+            Arc::new(MockModelProvider::default()),
+        );
+        let message = "addressed to line a only";
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("line-b".to_string()),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from(sendblue_webhook_body("+15551234567", message)),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| capture.message != message),
+            "alias B must not answer a message to line A"
+        );
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_bare_webhook_path_is_refused_with_several_aliases() {
+        let state = sendblue_test_state_with_lines(
+            &[("line-a", "+15550000000"), ("line-b", "+15550002222")],
+            Some("correct-secret"),
+            Config::default(),
+            Arc::new(MockModelProvider::default()),
+        );
+
+        let response = Box::pin(handle_sendblue_webhook(
+            State(state),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_bare_webhook_path_still_serves_a_single_alias() {
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let response = Box::pin(handle_sendblue_webhook(
+            State(state),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // ── Per-alias webhook routing───────────────────────────────────

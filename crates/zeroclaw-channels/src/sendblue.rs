@@ -3,7 +3,6 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, SendMessage};
 
 pub struct SendblueChannel {
@@ -24,17 +23,35 @@ pub struct SendblueChannel {
     /// Recently accepted `message_handle`s, oldest first.
     ///
     /// Sendblue asks endpoints to be idempotent because it re-delivers on a
-    /// non-2xx or a timeout, and the polling watermark is inclusive so the
-    /// boundary message comes back on the next sweep. One shared record keeps
-    /// both inbound paths from answering the same message twice.
+    /// non-2xx or a timeout, and each poll re-reads an overlap window. The
+    /// record is per instance: the gateway and the channel server hold
+    /// separate instances, so it does not de-duplicate across the two modes,
+    /// and it does not survive a restart.
     seen_handles: Mutex<VecDeque<String>>,
     /// `(succeeded, at)` for the last completed poll exchange. Read by
     /// `listener_health`, which must not perform I/O.
     poll_health: Mutex<Option<(bool, Instant)>>,
+    api_base: String,
     client: reqwest::Client,
 }
 
 const SENDBLUE_API_BASE: &str = "https://api.sendblue.com/api";
+
+/// Whole-request and connect deadlines for every Sendblue API call, so a
+/// blackholed endpoint cannot stall the poller or a send indefinitely.
+const API_TIMEOUT_SECS: u64 = 30;
+const API_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Read receipts are best effort and run off the dispatch path; this bounds
+/// how long one can keep its background task alive.
+const READ_RECEIPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One webhook-mode listener's queue, held weakly so the registry never keeps
+/// the orchestrator's receiver open after the listener has gone.
+struct ForwarderEntry {
+    registration: u64,
+    sender: tokio::sync::mpsc::WeakSender<ChannelMessage>,
+}
 
 /// Per-alias inbound forwarders registered by webhook-mode `listen()`.
 ///
@@ -46,29 +63,89 @@ const SENDBLUE_API_BASE: &str = "https://api.sendblue.com/api";
 /// gateway can hand verified inbound messages to the channel server and get
 /// the full conversational treatment while keeping webhook latency.
 static INBOUND_FORWARDERS: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ChannelMessage>>>,
+    Mutex<std::collections::HashMap<String, ForwarderEntry>>,
 > = std::sync::OnceLock::new();
 
-fn inbound_forwarders()
--> &'static Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ChannelMessage>>> {
+static NEXT_FORWARDER_REGISTRATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn inbound_forwarders() -> &'static Mutex<std::collections::HashMap<String, ForwarderEntry>> {
     INBOUND_FORWARDERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Forward one verified inbound message to the channel-server listener for
-/// `alias`, if one is registered. Returns the message back on failure so the
-/// caller can fall back to its own dispatch path.
-pub async fn forward_inbound_to_listener(
-    alias: &str,
-    msg: ChannelMessage,
-) -> Result<(), ChannelMessage> {
-    let sender = {
-        let forwarders = inbound_forwarders().lock();
-        forwarders.get(alias).cloned()
-    };
+/// Removes its alias's forwarder when the owning `listen()` future ends or is
+/// dropped, unless a newer listener has since replaced it.
+struct ForwarderRegistration {
+    alias: String,
+    registration: u64,
+}
+
+impl ForwarderRegistration {
+    fn register(alias: &str, sender: &tokio::sync::mpsc::Sender<ChannelMessage>) -> Self {
+        let registration =
+            NEXT_FORWARDER_REGISTRATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inbound_forwarders().lock().insert(
+            alias.to_string(),
+            ForwarderEntry {
+                registration,
+                sender: sender.downgrade(),
+            },
+        );
+        Self {
+            alias: alias.to_string(),
+            registration,
+        }
+    }
+}
+
+impl Drop for ForwarderRegistration {
+    fn drop(&mut self) {
+        let mut forwarders = inbound_forwarders().lock();
+        if forwarders
+            .get(&self.alias)
+            .is_some_and(|entry| entry.registration == self.registration)
+        {
+            forwarders.remove(&self.alias);
+        }
+    }
+}
+
+/// Why [`forward_inbound_to_listener`] did not admit a message. Both variants
+/// hand the message back so the caller can choose its own fallback.
+#[derive(Debug)]
+pub enum ForwardError {
+    /// No live webhook-mode listener is registered for the alias.
+    NoListener(Box<ChannelMessage>),
+    /// The listener's queue is full. The message was not admitted.
+    QueueFull(Box<ChannelMessage>),
+}
+
+impl ForwardError {
+    pub fn into_message(self) -> ChannelMessage {
+        match self {
+            Self::NoListener(msg) | Self::QueueFull(msg) => *msg,
+        }
+    }
+}
+
+/// Admit one verified inbound message to the channel-server listener for
+/// `alias` without waiting. Never blocks: a full queue is reported rather than
+/// awaited, so the caller decides before anything can cancel it whether the
+/// message was taken.
+pub fn forward_inbound_to_listener(alias: &str, msg: ChannelMessage) -> Result<(), ForwardError> {
+    let sender = inbound_forwarders()
+        .lock()
+        .get(alias)
+        .and_then(|entry| entry.sender.upgrade());
     let Some(sender) = sender else {
-        return Err(msg);
+        return Err(ForwardError::NoListener(Box::new(msg)));
     };
-    sender.send(msg).await.map_err(|failed| failed.0)
+    sender.try_send(msg).map_err(|err| match err {
+        tokio::sync::mpsc::error::TrySendError::Full(msg) => ForwardError::QueueFull(Box::new(msg)),
+        tokio::sync::mpsc::error::TrySendError::Closed(msg) => {
+            ForwardError::NoListener(Box::new(msg))
+        }
+    })
 }
 
 /// How long a successful poll stays evidence that the listener works. A
@@ -76,10 +153,22 @@ pub async fn forward_inbound_to_listener(
 /// stale success must stop counting.
 const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(120);
 
-/// Message handles retained for de-duplication. `created_at_gte` is inclusive
-/// and Sendblue's clock is not ours, so the same message can be returned by
-/// two consecutive polls.
-const SEEN_HANDLE_CAP: usize = 512;
+/// Message handles retained for de-duplication. Each poll re-reads an overlap
+/// window, so recently delivered messages come back and are dropped here.
+const SEEN_HANDLE_CAP: usize = 2048;
+
+/// The list API's maximum page size.
+const POLL_PAGE_LIMIT: usize = 100;
+
+/// Pages drained per poll before yielding to the next interval. Pages are read
+/// oldest first and the cursor only covers delivered pages, so a backlog
+/// larger than this is finished on later polls rather than skipped.
+const POLL_MAX_PAGES: usize = 10;
+
+/// Each poll re-reads this far behind the cursor. `date_sent` is the closest
+/// field to the `created_at` the filter uses and Sendblue's clock is not ours;
+/// the overlap absorbs both, and `claim_unseen` drops the repeats.
+const POLL_OVERLAP: Duration = Duration::from_secs(60);
 
 impl SendblueChannel {
     pub fn new(
@@ -117,8 +206,19 @@ impl SendblueChannel {
             read_receipts: false,
             seen_handles: Mutex::new(VecDeque::new()),
             poll_health: Mutex::new(None),
-            client: reqwest::Client::new(),
+            api_base: SENDBLUE_API_BASE.to_string(),
+            client: zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "channel.sendblue",
+                API_TIMEOUT_SECS,
+                API_CONNECT_TIMEOUT_SECS,
+            ),
         }
+    }
+
+    #[cfg(test)]
+    fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
     }
 
     /// Mark conversations read as inbound messages are accepted.
@@ -220,12 +320,13 @@ impl SendblueChannel {
         payload.get("data").unwrap_or(payload)
     }
 
-    /// Drop messages whose `message_handle` this channel has already accepted,
-    /// and record the rest.
+    /// Drop messages whose `message_handle` this channel instance has already
+    /// accepted, and record the rest.
     ///
-    /// Sendblue re-delivers a webhook that did not get a 2xx and returns the
-    /// boundary message again on the next poll, so without this the agent
-    /// answers some messages twice. Both inbound paths share one record.
+    /// Sendblue re-delivers a webhook that did not get a 2xx, and each poll
+    /// re-reads an overlap window, so without this the agent answers some
+    /// messages twice. A caller that claims a message and then fails to admit
+    /// it must [`Self::release`] it so the retry is not mistaken for a repeat.
     pub fn claim_unseen(&self, messages: Vec<ChannelMessage>) -> Vec<ChannelMessage> {
         let mut seen = self.seen_handles.lock();
         let mut fresh = Vec::with_capacity(messages.len());
@@ -250,46 +351,24 @@ impl SendblueChannel {
         fresh
     }
 
-    /// Mark the conversation with `recipient` as read, so the sender sees their
-    /// message has landed while the agent is still composing.
+    /// Forget claimed handles whose messages were not admitted, so Sendblue's
+    /// retry of them is processed rather than dropped as a repeat.
+    pub fn release(&self, handles: &[String]) {
+        self.seen_handles
+            .lock()
+            .retain(|seen| !handles.contains(seen));
+    }
+
+    /// Mark each distinct sender's conversation read, so they see their
+    /// message landed while the agent is still composing. One receipt per
+    /// conversation, not per message, because a debounced batch from one
+    /// sender is a single conversation.
     ///
     /// Best effort by contract: Sendblue documents no delivery confirmation,
     /// the endpoint is iMessage/RCS only (SMS carries no read state), and it
-    /// has to be enabled per account. A failure here must never hold up or fail
-    /// the inbound dispatch, so callers ignore the result and this logs at
-    /// debug.
-    pub async fn mark_read(&self, recipient: &str) -> anyhow::Result<()> {
-        if !self.read_receipts {
-            return Ok(());
-        }
-
-        let body = ::serde_json::json!({
-            "number": Self::normalize_e164(recipient),
-            "from_number": self.from_number,
-        });
-
-        let resp = self
-            .auth_headers(self.client.post(format!("{SENDBLUE_API_BASE}/mark-read")))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!("mark_read failed: {}", resp.status())
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Send read receipts for every distinct sender in `messages`, ignoring
-    /// failures. One receipt per conversation, not per message, because a
-    /// debounced batch from one sender is a single conversation.
-    pub async fn mark_read_for(&self, messages: &[ChannelMessage]) {
+    /// has to be enabled per account. Each receipt runs in its own bounded
+    /// background task, so a slow or failing endpoint cannot hold up dispatch.
+    pub fn spawn_read_receipts(&self, messages: &[ChannelMessage]) {
         if !self.read_receipts {
             return;
         }
@@ -300,27 +379,57 @@ impl SendblueChannel {
                 continue;
             }
             marked.push(&msg.reply_target);
-            let _ = self.mark_read(&msg.reply_target).await;
+
+            let request = self
+                .auth_headers(self.client.post(format!("{}/mark-read", self.api_base)))
+                .timeout(READ_RECEIPT_TIMEOUT)
+                .json(&::serde_json::json!({
+                    "number": Self::normalize_e164(&msg.reply_target),
+                    "from_number": self.from_number,
+                }));
+            zeroclaw_spawn::spawn!(async move {
+                let outcome = match request.send().await {
+                    Ok(resp) if resp.status().is_success() => return,
+                    Ok(resp) => resp.status().to_string(),
+                    Err(err) => err.to_string(),
+                };
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("mark_read failed: {outcome}")
+                );
+            });
         }
     }
 
-    /// Fetch inbound messages Sendblue recorded at or after `since`.
+    /// Fetch one page of inbound messages to this channel's line, recorded at
+    /// or after `since`, oldest first.
     ///
-    /// Returns the raw message objects so the caller can reuse
-    /// [`Self::parse_webhook_payload`]: the polling API and the webhook deliver
-    /// the same record shape, so both inbound paths share one parser and one
-    /// allowlist decision.
-    async fn fetch_inbound_since(
+    /// Direction and line are filtered by the API so the bot's own sends and
+    /// other lines' traffic cannot crowd a page. Returns the raw message
+    /// objects so the caller can reuse [`Self::parse_webhook_payload`]: the
+    /// polling API and the webhook deliver the same record shape, so both
+    /// inbound paths share one parser, one allowlist and one line check.
+    async fn fetch_inbound_page(
         &self,
         since: chrono::DateTime<chrono::Utc>,
+        offset: usize,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let url = format!("{SENDBLUE_API_BASE}/v2/messages");
+        let url = format!("{}/v2/messages", self.api_base);
 
         let resp = self
             .auth_headers(self.client.get(&url))
             .query(&[
-                ("limit", "50".to_string()),
-                ("created_at_gte", since.to_rfc3339()),
+                ("is_outbound", "false".to_string()),
+                ("sendblue_number", self.from_number.clone()),
+                (
+                    "created_at_gte",
+                    since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                ),
+                ("order_by", "createdAt".to_string()),
+                ("order_direction", "asc".to_string()),
+                ("limit", POLL_PAGE_LIMIT.to_string()),
+                ("offset", offset.to_string()),
             ])
             .send()
             .await?;
@@ -336,14 +445,56 @@ impl SendblueChannel {
         Ok(body
             .get("data")
             .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|item| !Self::is_outbound(item))
-                    .cloned()
-                    .collect()
-            })
+            .cloned()
             .unwrap_or_default())
+    }
+
+    /// One poll: drain the ordered window from `cursor - POLL_OVERLAP`, page
+    /// by page, handing each accepted message to `tx`.
+    ///
+    /// `cursor` advances only past pages whose messages have all been handed
+    /// over, so an error or the page cap leaves the rest for the next poll
+    /// instead of skipping it. Returns `Ok(false)` when the receiver is gone.
+    async fn poll_once(
+        &self,
+        cursor: &mut chrono::DateTime<chrono::Utc>,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<bool> {
+        let overlap = chrono::Duration::from_std(POLL_OVERLAP).unwrap_or_default();
+        let since = *cursor - overlap;
+
+        for page_index in 0..POLL_MAX_PAGES {
+            let page = self
+                .fetch_inbound_page(since, page_index * POLL_PAGE_LIMIT)
+                .await?;
+
+            let mut newest = *cursor;
+            let mut accepted = Vec::new();
+            for payload in &page {
+                if let Some(sent_at) = payload
+                    .get("date_sent")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                {
+                    newest = newest.max(sent_at.with_timezone(&chrono::Utc));
+                }
+                accepted.extend(self.claim_unseen(self.parse_webhook_payload(payload)));
+            }
+
+            self.spawn_read_receipts(&accepted);
+            for msg in accepted {
+                if tx.send(msg).await.is_err() {
+                    return Ok(false);
+                }
+            }
+            *cursor = newest;
+
+            if page.len() < POLL_PAGE_LIMIT {
+                break;
+            }
+        }
+
+        Ok(true)
     }
 
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
@@ -393,6 +544,54 @@ impl SendblueChannel {
             );
             return messages;
         }
+
+        // Webhooks are registered per account and the list API is account
+        // wide, so every line's traffic reaches every alias on the account.
+        // Only the alias that owns the destination line may answer it.
+        let line = ["sendblue_number", "to_number"].iter().find_map(|field| {
+            data.get(*field)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+        let Some(line) = line else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"alias": self.alias})),
+                "skipping message with no destination line"
+            );
+            return messages;
+        };
+        if Self::normalize_e164(line) != Self::normalize_e164(&self.from_number) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"alias": self.alias})),
+                "skipping message addressed to another Sendblue line"
+            );
+            return messages;
+        }
+
+        // `message_handle` is the idempotency key. An event without one would
+        // get a fresh identity on every retry and evade de-duplication.
+        let Some(id) = data
+            .get("message_handle")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"alias": self.alias})),
+                "skipping message with no message_handle"
+            );
+            return messages;
+        };
 
         let Some(from) = data
             .get("from_number")
@@ -458,13 +657,6 @@ impl SendblueChannel {
 
         // Sendblue conversations are keyed by handle, not by a chat id, so the
         // sender's number is also the reply target.
-        let id = data
-            .get("message_handle")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
-
         messages.push(ChannelMessage {
             id,
             reply_target: normalized_from.clone(),
@@ -512,10 +704,7 @@ impl Channel for SendblueChannel {
         });
 
         let resp = self
-            .auth_headers(
-                self.client
-                    .post(format!("{SENDBLUE_API_BASE}/send-message")),
-            )
+            .auth_headers(self.client.post(format!("{}/send-message", self.api_base)))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -551,15 +740,11 @@ impl Channel for SendblueChannel {
             // Publish this listener's queue so the gateway webhook handler can
             // route verified inbound messages through the channel server
             // (per-sender history, session persistence, interrupts) instead of
-            // the stateless gateway chat path.
-            inbound_forwarders()
-                .lock()
-                .insert(self.alias.clone(), tx.clone());
-
-            // Keep the task alive — it will be cancelled when the channel shuts down
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
+            // the stateless gateway chat path. The registration is withdrawn
+            // when this future ends or is dropped.
+            let _registration = ForwarderRegistration::register(&self.alias, &tx);
+            tx.closed().await;
+            return Ok(());
         };
 
         ::zeroclaw_log::record!(
@@ -569,19 +754,19 @@ impl Channel for SendblueChannel {
             "channel active (polling mode)"
         );
 
-        // Only messages that arrive from now on are ours to answer; replaying
-        // the account's backlog on every restart would re-answer old texts.
-        let mut watermark = chrono::Utc::now();
+        // Only messages that arrive from about now on are ours to answer;
+        // replaying the account's backlog on every restart would re-answer old
+        // texts.
+        let mut cursor = chrono::Utc::now();
 
         loop {
             tokio::time::sleep(interval).await;
 
-            let fetched = self.fetch_inbound_since(watermark).await;
-            let payloads = match fetched {
-                Ok(payloads) => {
-                    *self.poll_health.lock() = Some((true, Instant::now()));
-                    payloads
-                }
+            match self.poll_once(&mut cursor, &tx).await {
+                Ok(true) => *self.poll_health.lock() = Some((true, Instant::now())),
+                // Receiver dropped: the orchestrator is shutting this channel
+                // down.
+                Ok(false) => return Ok(()),
                 Err(err) => {
                     *self.poll_health.lock() = Some((false, Instant::now()));
                     ::zeroclaw_log::record!(
@@ -591,52 +776,16 @@ impl Channel for SendblueChannel {
                             .with_attrs(::serde_json::json!({"error": err.to_string()})),
                         "poll failed"
                     );
-                    continue;
-                }
-            };
-
-            let mut newest = watermark;
-
-            for payload in &payloads {
-                if let Some(sent_at) = payload
-                    .get("date_sent")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                {
-                    let sent_at = sent_at.with_timezone(&chrono::Utc);
-                    if sent_at > newest {
-                        newest = sent_at;
-                    }
-                }
-
-                // `created_at_gte` is inclusive, so the boundary message comes
-                // back on the next poll. `claim_unseen` drops it on the handle.
-                let parsed = self.claim_unseen(self.parse_webhook_payload(payload));
-                if parsed.is_empty() {
-                    continue;
-                }
-
-                // Ahead of dispatch: the point of the receipt is that the
-                // sender sees the message landed while the agent is still
-                // working on a reply.
-                self.mark_read_for(&parsed).await;
-
-                for msg in parsed {
-                    if tx.send(msg).await.is_err() {
-                        // Receiver dropped: the orchestrator is shutting this
-                        // channel down.
-                        return Ok(());
-                    }
                 }
             }
-
-            watermark = newest;
         }
     }
 
     fn listener_health(&self) -> Option<ListenerHealth> {
-        // Webhook mode does no exchange of its own, so it has no signal to
-        // report and must not claim health it cannot observe.
+        // Webhook mode does no exchange of its own. `None` keeps the
+        // supervisor's default meaning — the listener is alive, which here
+        // means its queue is registered for the gateway to forward into —
+        // rather than claiming a probe this mode never runs.
         self.poll_interval?;
         Some(match *self.poll_health.lock() {
             None => ListenerHealth::Pending,
@@ -649,7 +798,7 @@ impl Channel for SendblueChannel {
     async fn health_check(&self) -> bool {
         // Sendblue has no dedicated health route; the message list is the
         // cheapest authenticated GET that proves the credential pair works.
-        let url = format!("{SENDBLUE_API_BASE}/v2/messages?limit=1");
+        let url = format!("{}/v2/messages?limit=1", self.api_base);
 
         self.auth_headers(self.client.get(&url))
             .send()
@@ -667,7 +816,7 @@ impl Channel for SendblueChannel {
         let resp = self
             .auth_headers(
                 self.client
-                    .post(format!("{SENDBLUE_API_BASE}/send-typing-indicator")),
+                    .post(format!("{}/send-typing-indicator", self.api_base)),
             )
             .header("Content-Type", "application/json")
             .json(&body)
@@ -849,6 +998,7 @@ mod tests {
             "message_handle": "abc-123",
             "from_number": "+447700900123",
             "to_number": "+15550001111",
+            "sendblue_number": "+15550001111",
             "content": content,
             "is_outbound": false,
             "status": "RECEIVED",
@@ -1228,16 +1378,18 @@ mod tests {
     #[tokio::test]
     async fn read_receipts_are_off_unless_enabled() {
         // The endpoint is gated per account, so a channel that was never told
-        // to use receipts must not reach for it. With no HTTP mock in front of
-        // this, a call that did go out would fail the DNS/connect and surface
-        // as an error rather than `Ok`.
-        let channel = allowed_channel();
+        // to use receipts must not reach for it.
+        let _http = HTTP_TEST_LOCK.lock().await;
+        let server = wiremock::MockServer::start().await;
+        let channel = allowed_channel().with_api_base(server.uri());
+
+        channel.spawn_read_receipts(&channel.parse_webhook_payload(&inbound("hi")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(
-            channel.mark_read("+447700900123").await.is_ok(),
-            "receipts disabled must short-circuit before any request"
+            server.received_requests().await.unwrap().is_empty(),
+            "receipts disabled must not send any request"
         );
-        channel.mark_read_for(&[]).await;
     }
 
     #[test]
@@ -1262,5 +1414,357 @@ mod tests {
             Some(ListenerHealth::Pending),
             "a listener that has not yet polled is not evidence of health"
         );
+    }
+
+    /// Serializes tests that make HTTP requests, because one of them points
+    /// the process-global runtime proxy at a test server.
+    static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn line_channel(line: &str, alias: &str) -> SendblueChannel {
+        SendblueChannel::new(
+            "key-id".to_string(),
+            "secret-key".to_string(),
+            line.to_string(),
+            alias,
+            Arc::new(|| vec!["+447700900123".to_string()]),
+        )
+    }
+
+    #[test]
+    fn only_the_alias_owning_the_destination_line_accepts_a_message() {
+        let line_a = line_channel("+15550001111", "a");
+        let line_b = line_channel("+15550002222", "b");
+        let payload = inbound("for line a");
+
+        let accepted_a = line_a.parse_webhook_payload(&payload);
+        assert_eq!(accepted_a.len(), 1);
+        assert_eq!(accepted_a[0].channel_alias.as_deref(), Some("a"));
+        assert!(
+            line_b.parse_webhook_payload(&payload).is_empty(),
+            "an account-wide event for line A must not invoke or reply through alias B"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_to_number_for_the_destination_line() {
+        let mut payload = inbound("hi");
+        payload.as_object_mut().unwrap().remove("sendblue_number");
+        payload["to_number"] = serde_json::json!("15550001111");
+
+        assert_eq!(allowed_channel().parse_webhook_payload(&payload).len(), 1);
+    }
+
+    #[test]
+    fn drops_a_message_with_no_destination_line() {
+        let mut payload = inbound("hi");
+        let object = payload.as_object_mut().unwrap();
+        object.remove("sendblue_number");
+        object.remove("to_number");
+
+        assert!(allowed_channel().parse_webhook_payload(&payload).is_empty());
+    }
+
+    #[test]
+    fn drops_a_message_with_no_message_handle() {
+        let mut payload = inbound("hi");
+        payload.as_object_mut().unwrap().remove("message_handle");
+
+        assert!(
+            allowed_channel().parse_webhook_payload(&payload).is_empty(),
+            "an invented id would evade de-duplication on every retry"
+        );
+    }
+
+    #[test]
+    fn a_released_handle_can_be_claimed_again() {
+        let channel = allowed_channel();
+        let first = channel.claim_unseen(channel.parse_webhook_payload(&inbound("hello")));
+        assert_eq!(first.len(), 1);
+
+        channel.release(&[first[0].id.clone()]);
+
+        assert_eq!(
+            channel
+                .claim_unseen(channel.parse_webhook_payload(&inbound("hello")))
+                .len(),
+            1,
+            "a message that was never admitted must be accepted on retry"
+        );
+    }
+
+    fn page_record(index: usize, sent_at: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+        let mut record = inbound(&format!("message {index}"));
+        record["message_handle"] = serde_json::json!(format!("handle-{index}"));
+        record["date_sent"] =
+            serde_json::json!(sent_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        record
+    }
+
+    fn page_body(records: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "status": "OK", "data": records })
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>) -> Vec<String> {
+        let mut contents = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            contents.push(msg.content);
+        }
+        contents
+    }
+
+    #[tokio::test]
+    async fn polling_drains_every_page_in_order_without_duplicates() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _http = HTTP_TEST_LOCK.lock().await;
+        let server = wiremock::MockServer::start().await;
+        let start = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 3);
+        let records: Vec<_> = (0..150)
+            .map(|i| page_record(i, start + chrono::Duration::milliseconds(i as i64)))
+            .collect();
+
+        // Direction and line are filtered at the API, so outbound traffic
+        // cannot fill a page and hide an inbound record behind it.
+        let base = || {
+            Mock::given(method("GET"))
+                .and(path("/v2/messages"))
+                .and(query_param("is_outbound", "false"))
+                .and(query_param("sendblue_number", "+15550001111"))
+                .and(query_param("order_direction", "asc"))
+                .and(query_param("limit", "100"))
+        };
+        base()
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body(records[..100].to_vec())),
+            )
+            .mount(&server)
+            .await;
+        base()
+            .and(query_param("offset", "100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body(records[100..].to_vec())),
+            )
+            .mount(&server)
+            .await;
+
+        let channel = allowed_channel().with_api_base(server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(512);
+        let mut cursor = start;
+
+        assert!(channel.poll_once(&mut cursor, &tx).await.unwrap());
+        let expected: Vec<String> = (0..150).map(|i| format!("message {i}")).collect();
+        assert_eq!(drain(&mut rx), expected, "both pages, oldest first");
+        assert_eq!(cursor, start + chrono::Duration::milliseconds(149));
+
+        // The next poll re-reads the overlap window and gets the same records
+        // back; none of them may be dispatched again.
+        assert!(channel.poll_once(&mut cursor, &tx).await.unwrap());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_leaves_the_cursor_behind_the_undelivered_records() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _http = HTTP_TEST_LOCK.lock().await;
+        let server = wiremock::MockServer::start().await;
+        let start = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 3);
+        let records: Vec<_> = (0..120)
+            .map(|i| page_record(i, start + chrono::Duration::milliseconds(i as i64)))
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/messages"))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body(records[..100].to_vec())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/messages"))
+            .and(query_param("offset", "100"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/messages"))
+            .and(query_param("offset", "100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body(records[100..].to_vec())),
+            )
+            .mount(&server)
+            .await;
+
+        let channel = allowed_channel().with_api_base(server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(512);
+        let mut cursor = start;
+
+        assert!(channel.poll_once(&mut cursor, &tx).await.is_err());
+        assert_eq!(
+            drain(&mut rx).len(),
+            100,
+            "the delivered page stays delivered"
+        );
+        assert_eq!(
+            cursor,
+            start + chrono::Duration::milliseconds(99),
+            "the cursor covers only the page that was handed over"
+        );
+
+        assert!(channel.poll_once(&mut cursor, &tx).await.unwrap());
+        let expected: Vec<String> = (100..120).map(|i| format!("message {i}")).collect();
+        assert_eq!(
+            drain(&mut rx),
+            expected,
+            "the failed page is recovered, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_read_receipt_does_not_delay_dispatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _http = HTTP_TEST_LOCK.lock().await;
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mark-read"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page_body(vec![page_record(0, chrono::Utc::now())])),
+            )
+            .mount(&server)
+            .await;
+
+        let channel = allowed_channel()
+            .with_read_receipts(true)
+            .with_api_base(server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut cursor = chrono::Utc::now();
+
+        tokio::time::timeout(Duration::from_secs(5), channel.poll_once(&mut cursor, &tx))
+            .await
+            .expect("a blackholed mark-read endpoint must not hold up the poll")
+            .unwrap();
+        assert_eq!(drain(&mut rx), vec!["message 0".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn api_calls_go_through_the_runtime_proxy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        let _http = HTTP_TEST_LOCK.lock().await;
+        let proxy = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_body(vec![])))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(proxy.uri()),
+            scope: ProxyScope::Services,
+            services: vec!["channel.sendblue".to_string()],
+            ..Default::default()
+        });
+        // `.invalid` never resolves, so the request can only succeed if the
+        // client hands it to the configured proxy.
+        let channel = allowed_channel().with_api_base("http://sendblue.invalid/api");
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        assert!(
+            channel.health_check().await,
+            "the probe must reach the proxy"
+        );
+    }
+
+    fn webhook_channel(alias: &str) -> Arc<SendblueChannel> {
+        Arc::new(SendblueChannel::new(
+            "key-id".to_string(),
+            "secret-key".to_string(),
+            "+15550001111".to_string(),
+            alias,
+            Arc::new(|| vec!["+447700900123".to_string()]),
+        ))
+    }
+
+    fn forwarded_message(alias: &str) -> ChannelMessage {
+        webhook_channel(alias).parse_webhook_payload(&inbound("forwarded"))[0].clone()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_webhook_listener_releases_the_dispatch_queue() {
+        let alias = "forwarder-cancel";
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let channel = webhook_channel(alias);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while inbound_forwarders().lock().get(alias).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener registers its forwarder");
+        forward_inbound_to_listener(alias, forwarded_message(alias)).unwrap();
+        assert!(rx.recv().await.is_some());
+
+        listener.abort();
+        let _ = listener.await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the receiver must close once the listener is gone")
+                .is_none(),
+            "nothing may keep the orchestrator's receiver open after cancellation"
+        );
+        assert!(matches!(
+            forward_inbound_to_listener(alias, forwarded_message(alias)),
+            Err(ForwardError::NoListener(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_listener_keeps_its_successors_registration() {
+        let alias = "forwarder-replace";
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(8);
+
+        let old = ForwarderRegistration::register(alias, &old_tx);
+        let _new = ForwarderRegistration::register(alias, &new_tx);
+        drop(old);
+
+        forward_inbound_to_listener(alias, forwarded_message(alias))
+            .expect("the newer listener must still receive forwards");
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_full_listener_queue_is_reported_not_awaited() {
+        let alias = "forwarder-full";
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _registration = ForwarderRegistration::register(alias, &tx);
+
+        forward_inbound_to_listener(alias, forwarded_message(alias)).unwrap();
+        let err = forward_inbound_to_listener(alias, forwarded_message(alias))
+            .expect_err("the second message does not fit");
+
+        assert!(matches!(err, ForwardError::QueueFull(_)));
+        assert_eq!(err.into_message().content, "forwarded");
     }
 }
